@@ -5,12 +5,15 @@ This module is used by both OpenAI compatibility layer and native Gemini endpoin
 import json
 import logging
 import requests
+import time
+import os
 from fastapi import Response
 from fastapi.responses import StreamingResponse
 from google.auth.transport.requests import Request as GoogleAuthRequest
+import asyncio
 
-from .auth import get_credentials, save_credentials, get_user_project_id, onboard_user
-from .utils import get_user_agent
+from .auth import get_next_credential, save_credentials
+from .utils import get_user_agent, get_client_metadata
 from .config import (
     CODE_ASSIST_ENDPOINT,
     DEFAULT_SAFETY_SETTINGS,
@@ -19,7 +22,80 @@ from .config import (
     get_thinking_budget,
     should_include_thoughts
 )
-import asyncio
+
+# --- Project ID and Onboarding Logic ---
+# This logic is kept here as it's tightly coupled with API requests.
+
+def get_user_project_id(creds):
+    """
+    Get the user's project ID from a credential object or by making an API call.
+    The project_id is cached on the credential object itself.
+    """
+    # 1. Check if project_id is already cached on the credential object
+    if hasattr(creds, 'project_id') and creds.project_id:
+        return creds.project_id
+
+    # 2. If not, fetch it from the API
+    logging.info("Project ID not found on credential, fetching from API...")
+    try:
+        headers = {
+            "Authorization": f"Bearer {creds.token}",
+            "User-Agent": get_user_agent()
+        }
+        response = requests.get("https://cloudresourcemanager.googleapis.com/v1/projects", headers=headers)
+        response.raise_for_status()
+        projects = response.json().get("projects", [])
+        
+        if not projects:
+            raise Exception("No Google Cloud projects found for this account.")
+            
+        project_id = projects[0]["projectId"]
+        logging.info(f"Discovered project ID: {project_id}")
+        
+        # Cache the project ID on the credential object for future use
+        creds.project_id = project_id
+        
+        # If credentials came from a file, update it with the new project ID
+        # This check is a bit indirect, but effective.
+        if os.getenv("GEMINI_CREDENTIALS") is None:
+            save_credentials(creds, project_id)
+
+        return project_id
+    except Exception as e:
+        logging.error(f"Failed to get user project ID: {e}")
+        return None
+
+def onboard_user(creds, project_id):
+    """
+    Onboard the user for the given project ID. A check is made to see if onboarding
+    has already been done for this credential to avoid duplicate requests.
+    """
+    # Check if onboarding has already been completed for this credential
+    if hasattr(creds, 'onboarding_complete') and creds.onboarding_complete:
+        return
+
+    logging.info(f"Performing onboarding check for project: {project_id}")
+    try:
+        headers = {
+            "Authorization": f"Bearer {creds.token}",
+            "Content-Type": "application/json",
+            "User-Agent": get_user_agent(),
+        }
+        data = {"clientMetadata": get_client_metadata(project_id)}
+        response = requests.post(f"{CODE_ASSIST_ENDPOINT}/v1internal/projects/{project_id}:onboard", headers=headers, json=data)
+        
+        if response.status_code == 409: # Conflict, already onboarded
+             logging.info("User already onboarded for this project.")
+        elif response.ok:
+            logging.info("User successfully onboarded.")
+        else:
+            response.raise_for_status()
+
+        # Mark this credential as onboarded
+        creds.onboarding_complete = True
+
+    except Exception as e:
+        logging.warning(f"Onboarding request failed (this may be expected if already onboarded): {e}")
 
 
 def send_gemini_request(payload: dict, is_streaming: bool = False) -> Response:
@@ -33,35 +109,20 @@ def send_gemini_request(payload: dict, is_streaming: bool = False) -> Response:
     Returns:
         FastAPI Response object
     """
-    # Get and validate credentials
-    creds = get_credentials()
-    if not creds:
-        return Response(
-            content="Authentication failed. Please restart the proxy to log in.", 
-            status_code=500
-        )
-    
+    # Get the next available credential from the pool
+    creds = get_next_credential()
+    if not creds or not creds.token:
+        error_msg = "Authentication failed. No valid credentials available in the pool."
+        logging.error(error_msg)
+        return Response(content=error_msg, status_code=500)
 
-    # Refresh credentials if needed
-    if creds.expired and creds.refresh_token:
-        try:
-            creds.refresh(GoogleAuthRequest())
-            save_credentials(creds)
-        except Exception as e:
-            return Response(
-                content="Token refresh failed. Please restart the proxy to re-authenticate.", 
-                status_code=500
-            )
-    elif not creds.token:
-        return Response(
-            content="No access token. Please restart the proxy to re-authenticate.", 
-            status_code=500
-        )
-
-    # Get project ID and onboard user
+    # Get project ID and onboard user for this specific credential
     proj_id = get_user_project_id(creds)
     if not proj_id:
-        return Response(content="Failed to get user project ID.", status_code=500)
+        return Response(content="Failed to get user project ID for the selected account.", status_code=500)
+    
+    # Log which credential (by project_id) is being used for this request.
+    logging.info(f"Using credential for project: {proj_id}")
     
     onboard_user(creds, proj_id)
 
@@ -109,7 +170,6 @@ def send_gemini_request(payload: dict, is_streaming: bool = False) -> Response:
             status_code=500,
             media_type="application/json"
         )
-
 
 def _handle_streaming_response(resp) -> StreamingResponse:
     """Handle streaming response from Google API."""
@@ -172,7 +232,7 @@ def _handle_streaming_response(resp) -> StreamingResponse:
                                     response_json = json.dumps(response_chunk, separators=(',', ':'))
                                     response_line = f"data: {response_json}\n\n"
                                     yield response_line.encode('utf-8', "ignore")
-                                    await asyncio.sleep(0)
+                                    await asyncio.sleep(0) # Give other tasks a chance to run
                                 else:
                                     obj_json = json.dumps(obj, separators=(',', ':'))
                                     yield f"data: {obj_json}\n\n".encode('utf-8', "ignore")
@@ -215,7 +275,6 @@ def _handle_streaming_response(resp) -> StreamingResponse:
         media_type="text/event-stream",
         headers=response_headers
     )
-
 
 def _handle_non_streaming_response(resp) -> Response:
     """Handle non-streaming response from Google API."""
@@ -269,7 +328,6 @@ def _handle_non_streaming_response(resp) -> Response:
             media_type=resp.headers.get("Content-Type")
         )
 
-
 def build_gemini_payload_from_openai(openai_payload: dict) -> dict:
     """
     Build a Gemini API payload from an OpenAI-transformed request.
@@ -300,7 +358,6 @@ def build_gemini_payload_from_openai(openai_payload: dict) -> dict:
         "request": request_data
     }
 
-
 def build_gemini_payload_from_native(native_request: dict, model_from_path: str) -> dict:
     """
     Build a Gemini API payload from a native Gemini request.
@@ -310,9 +367,7 @@ def build_gemini_payload_from_native(native_request: dict, model_from_path: str)
     
     if "generationConfig" not in native_request:
         native_request["generationConfig"] = {}
-        
-    # native_request["enableEnhancedCivicAnswers"] = False
-    
+
     if "thinkingConfig" not in native_request["generationConfig"]:
         native_request["generationConfig"]["thinkingConfig"] = {}
     

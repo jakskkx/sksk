@@ -4,7 +4,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from .gemini_routes import router as gemini_router
 from .openai_routes import router as openai_router
-from .auth import get_credentials, get_user_project_id, onboard_user
+from .auth import load_credentials_pool
 
 # Load environment variables from .env file
 try:
@@ -36,60 +36,17 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event():
     try:
-        logging.info("Starting Gemini proxy server...")
+        logging.info("Starting Gemini proxy server and loading credentials...")
         
-        # Check if credentials exist
-        import os
-        from .config import CREDENTIAL_FILE
+        # Load all credentials from environment variables or file into the pool.
+        # This will also handle the interactive OAuth flow if no credentials are found.
+        load_credentials_pool(allow_oauth_flow=True)
         
-        env_creds_json = os.getenv("GEMINI_CREDENTIALS")
-        creds_file_exists = os.path.exists(CREDENTIAL_FILE)
-        
-        if env_creds_json or creds_file_exists:
-            try:
-                # Try to load existing credentials without OAuth flow first
-                creds = get_credentials(allow_oauth_flow=False)
-                if creds:
-                    try:
-                        proj_id = get_user_project_id(creds)
-                        if proj_id:
-                            onboard_user(creds, proj_id)
-                            logging.info(f"Successfully onboarded with project ID: {proj_id}")
-                        logging.info("Gemini proxy server started successfully")
-                        logging.info("Authentication required - Password: see .env file")
-                    except Exception as e:
-                        logging.error(f"Setup failed: {str(e)}")
-                        logging.warning("Server started but may not function properly until setup issues are resolved.")
-                else:
-                    logging.warning("Credentials file exists but could not be loaded. Server started - authentication will be required on first request.")
-            except Exception as e:
-                logging.error(f"Credential loading error: {str(e)}")
-                logging.warning("Server started but credentials need to be set up.")
-        else:
-            # No credentials found - prompt user to authenticate
-            logging.info("No credentials found. Starting OAuth authentication flow...")
-            try:
-                creds = get_credentials(allow_oauth_flow=True)
-                if creds:
-                    try:
-                        proj_id = get_user_project_id(creds)
-                        if proj_id:
-                            onboard_user(creds, proj_id)
-                            logging.info(f"Successfully onboarded with project ID: {proj_id}")
-                        logging.info("Gemini proxy server started successfully")
-                    except Exception as e:
-                        logging.error(f"Setup failed: {str(e)}")
-                        logging.warning("Server started but may not function properly until setup issues are resolved.")
-                else:
-                    logging.error("Authentication failed. Server started but will not function until credentials are provided.")
-            except Exception as e:
-                logging.error(f"Authentication error: {str(e)}")
-                logging.warning("Server started but authentication failed.")
-        
-        logging.info("Authentication required - Password: see .env file")
-        
+        logging.info("Gemini proxy server started successfully.")
+        logging.info("Authentication required - Password: see .env file or config.")
+
     except Exception as e:
-        logging.error(f"Startup error: {str(e)}")
+        logging.error(f"Fatal startup error: {str(e)}")
         logging.warning("Server may not function properly.")
 
 @app.options("/{full_path:path}")
@@ -115,8 +72,8 @@ async def root():
     return {
         "name": "geminicli2api",
         "description": "OpenAI-compatible API proxy for Google's Gemini models via gemini-cli",
-        "purpose": "Provides both OpenAI-compatible endpoints (/v1/chat/completions) and native Gemini API endpoints for accessing Google's Gemini models",
-        "version": "1.0.0",
+        "purpose": "Provides both OpenAI-compatible endpoints (/v1/chat/completions) and native Gemini API endpoints for accessing Google's Gemini models with multi-account round-robin support.",
+        "version": "1.1.0-multi-account",
         "endpoints": {
             "openai_compatible": {
                 "chat_completions": "/v1/chat/completions",
@@ -130,7 +87,7 @@ async def root():
             "health": "/health"
         },
         "authentication": "Required for all endpoints except root and health",
-        "repository": "https://github.com/user/geminicli2api"
+        "repository": "https://github.com/user/geminicli2api" # Please update this if you have a repo
     }
 
 # Health check endpoint for Docker/Hugging Face

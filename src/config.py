@@ -24,7 +24,16 @@ SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CREDENTIAL_FILE = os.path.join(SCRIPT_DIR, os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "oauth_creds.json"))
 
 # Authentication
+# GEMINI_AUTH_PASSWORD can be set in your environment, e.g., in a .env file.
 GEMINI_AUTH_PASSWORD = os.getenv("GEMINI_AUTH_PASSWORD", "123456")
+
+# --- NEW: Multi-Account Credential Configuration ---
+# To use multiple accounts, set the GEMINI_CREDENTIALS environment variable
+# to a JSON array string. Each element should be the content of an oauth_creds.json file.
+# Example for .env file:
+# GEMINI_CREDENTIALS='[{"refresh_token": "token_1", ...}, {"refresh_token": "token_2", ...}]'
+# The proxy will use these accounts in a round-robin fashion.
+# If this is not set or not a valid array, it will fall back to using the CREDENTIAL_FILE.
 
 # Default Safety Settings for Google API
 DEFAULT_SAFETY_SETTINGS = [
