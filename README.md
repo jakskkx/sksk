@@ -1,5 +1,5 @@
 ---
-title: Gemini CLI to API Proxy
+title: bydblwcnm
 emoji: 🤖
 colorFrom: blue
 colorTo: purple
