@@ -168,52 +168,24 @@ def load_credentials_pool(allow_oauth_flow=True):
     
     creds_list = []
     
-    # 1. Prioritize numbered GEMINI_CREDENTIALS{i} environment variables
-    # This supports multi-line JSON values.
-    numbered_creds_found = False
-    i = 1
-    while True:
-        env_var_name = f"GEMINI_CREDENTIALS{i}"
-        cred_json_str = os.getenv(env_var_name)
-        if cred_json_str is None:
-            break
-        
-        numbered_creds_found = True
+    # 1. Prioritize GEMINI_CREDENTIALS environment variable
+    env_creds_json = os.getenv("GEMINI_CREDENTIALS")
+    if env_creds_json:
         try:
-            # json.loads can handle multi-line strings directly
-            cred_data = json.loads(cred_json_str)
-            logging.info(f"Found {env_var_name}. Processing...")
-            creds = _create_credential_from_dict(cred_data, f"env ({env_var_name})")
-            if creds:
-                # Attach metadata for logging
-                creds.credential_source_type = 'numbered'
-                creds.credential_source_index = i
-                creds_list.append(creds)
+            creds_data_list = json.loads(env_creds_json)
+            # Support both a single object and a list of objects
+            if not isinstance(creds_data_list, list):
+                creds_data_list = [creds_data_list]
+            
+            logging.info(f"Found {len(creds_data_list)} credential(s) in GEMINI_CREDENTIALS.")
+            for i, cred_data in enumerate(creds_data_list):
+                creds = _create_credential_from_dict(cred_data, f"env (index {i})")
+                if creds:
+                    creds_list.append(creds)
         except json.JSONDecodeError as e:
-            logging.error(f"Failed to parse JSON from {env_var_name}: {e}")
-        
-        i += 1
+            logging.error(f"Failed to parse GEMINI_CREDENTIALS JSON: {e}. Falling back to file.")
     
-    # 2. If no numbered creds are found, check for the single GEMINI_CREDENTIALS array
-    if not numbered_creds_found:
-        env_creds_json_array = os.getenv("GEMINI_CREDENTIALS")
-        if env_creds_json_array:
-            try:
-                creds_data_list = json.loads(env_creds_json_array)
-                if not isinstance(creds_data_list, list):
-                    creds_data_list = [creds_data_list]
-                
-                logging.info(f"Found {len(creds_data_list)} credential(s) in GEMINI_CREDENTIALS array.")
-                for idx, cred_data in enumerate(creds_data_list):
-                    creds = _create_credential_from_dict(cred_data, f"env (array, index {idx})")
-                    if creds:
-                         # Attach metadata for logging
-                        creds.credential_source_type = 'array_or_file'
-                        creds_list.append(creds)
-            except json.JSONDecodeError as e:
-                logging.error(f"Failed to parse GEMINI_CREDENTIALS JSON array: {e}. Falling back to file.")
-
-    # 3. Fallback to credential file if no env vars are used
+    # 2. Fallback to credential file if env var is not used or fails
     if not creds_list and os.path.exists(CREDENTIAL_FILE):
         try:
             with open(CREDENTIAL_FILE, "r") as f:
@@ -221,22 +193,22 @@ def load_credentials_pool(allow_oauth_flow=True):
             logging.info(f"Loading credential from file: {CREDENTIAL_FILE}")
             creds = _create_credential_from_dict(cred_data, f"file ({CREDENTIAL_FILE})")
             if creds:
-                creds.credential_source_type = 'array_or_file'
                 creds_list.append(creds)
         except Exception as e:
             logging.error(f"Failed to read or process credentials file {CREDENTIAL_FILE}: {e}")
 
-    # 4. If no credentials found, trigger interactive OAuth flow if allowed
+    # 3. If no credentials found, trigger interactive OAuth flow if allowed
     if not creds_list and allow_oauth_flow:
         logging.info("No valid credentials found. Starting interactive OAuth flow.")
         creds = _run_oauth_flow()
         if creds:
+            # We assume project_id will be fetched and saved during the first API call
             save_credentials(creds)
-            creds.credential_source_type = 'oauth_flow'
             creds_list.append(creds)
 
     credential_pool = creds_list
     if credential_pool:
+        # For simplicity, use the project ID from the first available credential
         first_creds = credential_pool[0]
         user_project_id = getattr(first_creds, 'project_id', None)
         logging.info(f"Successfully loaded {len(credential_pool)} credential(s). Pool is ready.")
@@ -252,20 +224,23 @@ def get_next_credential() -> Credentials | None:
             logging.error("Credential pool is empty. Cannot get a credential.")
             return None
 
+        # Select the next credential
         index = current_credential_index
         creds = credential_pool[index]
         
+        # Move to the next index for the subsequent call
         current_credential_index = (index + 1) % len(credential_pool)
 
+    # Refresh the token if it's expired. This is done outside the lock to avoid blocking.
     if creds.expired and creds.refresh_token:
         try:
-            source_type = getattr(creds, 'credential_source_type', 'unknown')
-            source_index = getattr(creds, 'credential_source_index', index)
-            logging.info(f"Credential from source '{source_type}' index {source_index} is expired. Refreshing...")
+            logging.info(f"Credential at index {index} is expired. Refreshing...")
             creds.refresh(GoogleAuthRequest())
-            logging.info(f"Credential refreshed successfully.")
+            logging.info(f"Credential at index {index} refreshed successfully.")
+            # Since creds is a mutable object, the pool is updated automatically.
         except Exception as e:
-            logging.error(f"Failed to refresh credential: {e}")
+            logging.error(f"Failed to refresh credential at index {index}: {e}")
+            # The request might still succeed with the old token, or fail gracefully.
 
     return creds
 
@@ -311,3 +286,5 @@ def _run_oauth_flow():
     except Exception as e:
         logging.error(f"Failed to fetch token with auth code: {e}")
         return None
+
+# The faulty import statement that was here has been removed.
